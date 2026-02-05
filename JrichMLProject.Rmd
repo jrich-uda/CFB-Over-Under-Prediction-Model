@@ -1,0 +1,958 @@
+---
+output:
+  html_document: default
+  word_document: default
+---
+```{r Getting Organized, echo = FALSE} 
+# install.packages("cfbfastR")
+# install.packages("tidyverse")
+# install.packages("recipes")
+# install.packages("ranger")
+# install.packages("rsample")
+# install.packages("caret")
+# install.packages("tibble")
+# install.packages("xgboost")
+# install.packages("writexl")
+# install.packages("openxlsx")
+library(openxlsx)
+library(cfbfastR)
+library(tidyverse)
+library(randomForest)
+library(recipes)
+library(ranger)
+library(rsample)
+library(caret)
+library(tibble)
+library(xgboost)
+library(writexl)
+Sys.setenv(CFBD_API_KEY="du2EUWMPujbTErLIPh1uamuYz10PF+mmv1DkkF8dGAQ2xX8e31osXuS9Kc091rNL")
+Sys.getenv("CFBD_API_KEY")
+```
+
+```{r Overall Dataset Review 2024}
+summary(cfbd_betting_lines(year = 2024, season_type = "regular"))
+head(cfbd_betting_lines(year = 2024, season_type = "regular"))
+```
+
+```{r Overall Dataset Review 2025}
+summary(cfbd_betting_lines(year = 2025, season_type = "regular"))
+head(cfbd_betting_lines(year = 2025, season_type = "regular"))
+```
+
+```{r Cleaning Data}
+df_labeled <- cfbd_betting_lines(year = 2024, season_type = "regular") %>%
+  mutate(
+    actual_total = as.numeric(home_score) + as.numeric(away_score),
+    ou_result = case_when(
+      !is.na(actual_total) & !is.na(over_under) & actual_total >  over_under ~ "Over",
+      !is.na(actual_total) & !is.na(over_under) & actual_total <  over_under ~ "Under",
+      !is.na(actual_total) & !is.na(over_under) & actual_total == over_under ~ "Push",
+      TRUE ~ NA_character_
+    ),
+    ou_binary = case_when(
+      ou_result == "Over"  ~ 1L,
+      ou_result == "Under" ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+```
+
+```{r Investigating variables}
+summary(cfbd_game_info(year = 2024, season_type = "regular")) 
+head(cfbd_game_info(year = 2024, season_type = "regular"))
+```
+
+
+```{r Game Info}
+temp <- cfbd_game_info(2024)
+temp <- as.data.frame(temp)
+df_labeled <- as.data.frame(df_labeled)
+```
+
+
+```{r Merging}
+full_data <- merge(df_labeled, temp, by.x = c("game_id"), by.y = c("game_id"), all.x = TRUE)
+```
+
+
+```{r Merging 2}
+full_data <- merge(df_labeled, temp, by = names(df_labeled)[names(df_labeled) %in% names(temp)], all.x = TRUE)
+```
+
+```{r Joining Draft Picks}
+summary(cfbd_draft_picks(2024))
+head(cfbd_draft_picks(2024))
+
+draftpicks <- cfbd_draft_picks(2024)
+draftpicks <- as.data.frame(draftpicks)
+
+draft_counts <- draftpicks %>%
+  group_by(college_team) %>%
+  summarise(draft_picks = n(), .groups = "drop")
+
+full_data <- full_data %>%
+  left_join(draft_counts, by = c("home_team" = "college_team")) %>%
+  rename(home_draft_picks = draft_picks) %>%
+  left_join(draft_counts, by = c("away_team" = "college_team")) %>%
+  rename(away_draft_picks = draft_picks)
+
+
+full_data <- full_data %>%
+  mutate(
+    home_draft_picks = replace_na(home_draft_picks, 0),
+    away_draft_picks = replace_na(away_draft_picks, 0)
+  )
+```
+
+```{r Investigating/Merging Advanced Statistics}
+head(cfbd_game_team_stats(2024))
+
+head(cfbd_stats_season_advanced(2024))
+adv_stats <- as.data.frame(cfbd_stats_game_advanced(2024))
+
+full_data <- merge(full_data, adv_stats, by = names(full_data)[names(full_data) %in% names(adv_stats)], all.x = TRUE)
+
+full_data <- full_data %>%
+  distinct(game_id, .keep_all = TRUE) 
+full_data <- full_data %>% filter(!is.na(actual_total))
+
+model_data <- full_data %>%
+  select(-game_id, -home_team, -away_team, -ou_result, -actual_total, -notes) 
+
+model_data <- model_data %>%
+  mutate(ou_binary = factor(ou_binary, levels = c(0,1), labels = c("Under","Over")))
+
+```
+
+```{r Random Forest} 
+# Splitting Data
+set.seed(42)
+spl <- initial_split(full_data, prop = 0.7)
+train_df <- training(spl)
+test_df  <- testing(spl)
+
+rec <- recipe(actual_total ~ ., data = train_df) %>%
+  step_rm(game_id, home_team, away_team, ou_binary, ou_result,
+          notes, season_type, seasonType, formatted_spread, provider,
+          start_time_tbd, start_date, completed, home_division, away_division,
+          highlights, home_score, away_score, home_points, away_points) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_knn(all_predictors(), neighbors = 5)
+
+prep_rec <- prep(rec, training = train_df)
+train_proc <- bake(prep_rec, new_data = train_df)
+test_proc  <- bake(prep_rec, new_data = test_df)
+
+# Training Model
+set.seed(123)
+rf_reg <- ranger(
+  actual_total ~ .,
+  data = train_proc,
+  num.trees = 500,
+  importance = "permutation",
+)
+
+# Testing Model
+pred_total <- predict(rf_reg, data = test_proc)$predictions
+
+pred_class <- ifelse(pred_total > test_proc$over_under, "Over", "Under")
+
+cm <- confusionMatrix(
+  factor(pred_class, levels = c("Under","Over")),
+  factor(test_df$ou_result, levels = c("Under","Over")),
+  positive = "Over"
+)
+cm
+
+
+pred_total <- predict(rf_reg, data = test_proc)$predictions  
+margin <- pred_total - test_proc$over_under 
+
+library(pROC)
+truth <- factor(test_df$ou_result, levels = c("Under","Over"))
+roc_obj <- roc(response = truth, predictor = margin, levels = c("Under","Over"), direction = "<")
+print(auc(roc_obj))
+
+roc_df <- tibble(
+  FPR = 1 - roc_obj$specificities,
+  TPR = roc_obj$sensitivities
+)
+
+ggplot(roc_df, aes(FPR, TPR)) +
+  geom_line(size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = paste0("ROC Curve (AUC = ", round(auc(roc_obj), 3), ")"),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal(base_size = 14)
+
+```
+
+```{r Variable Importance}
+importance_df <- rf_reg$variable.importance %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  rename(importance = 2) %>%
+  arrange(desc(importance))
+
+# View top variables
+head(importance_df, 15)
+```
+
+```{r}
+temp2 <- load_cfb_pbp(2024)
+```
+
+
+
+```{r Creating Window} 
+home_pass_epa <- away_pass_epa <- home_rush_epa <- away_rush_epa<- rep(NA, nrow(full_data))
+window = 5
+
+for (i in seq_len(nrow(full_data))) {
+  t1 <- temp2[
+    temp2$pos_team == full_data$home_team[i] &
+    temp2$week <  full_data$week[i] &
+    temp2$week >= full_data$week[i] - window, ]
+
+  if (nrow(t1) > 0) {
+    home_pass_epa[i] <- mean(t1$EPA[t1$pass == 1 | t1$pass == TRUE], na.rm = TRUE)
+    home_rush_epa[i] <- mean(t1$EPA[t1$rush == 1 | t1$rush == TRUE], na.rm = TRUE)
+  }
+
+  t2 <- temp2[
+    temp2$pos_team == full_data$away_team[i] &
+    temp2$week <  full_data$week[i] &
+    temp2$week >= full_data$week[i] - window, ]
+
+  if (nrow(t2) > 0) {
+    away_pass_epa[i] <- mean(t2$EPA[t2$pass == 1 | t2$pass == TRUE], na.rm = TRUE)
+    away_rush_epa[i] <- mean(t2$EPA[t2$rush == 1 | t2$rush == TRUE], na.rm = TRUE)
+  }
+}
+```
+
+
+
+```{r}
+full_data$home_pass_epa <- home_pass_epa
+full_data$home_rush_epa <- home_rush_epa
+full_data$away_pass_epa <- away_pass_epa
+full_data$away_rush_epa <- away_rush_epa
+```
+
+
+
+
+
+
+```{r Derived Variables}
+
+n <- nrow(full_data)
+home_rz_epa        <- away_rz_epa        <- rep(NA_real_, n)
+home_q4_epa        <- away_q4_epa        <- rep(NA_real_, n)
+home_pen_yds_pg    <- away_pen_yds_pg    <- rep(NA_real_, n)
+home_min_per_point <- away_min_per_point <- rep(NA_real_, n)
+
+for (i in seq_len(n)) {
+  wk_i <- full_data$week[i]
+  home <- full_data$home_team[i]
+  away <- full_data$away_team[i]
+
+  t1 <- temp2[
+    temp2$pos_team == home &
+    temp2$week <  wk_i &
+    temp2$week >= wk_i - window,
+  , drop = FALSE]
+
+  t2 <- temp2[
+    temp2$pos_team == away &
+    temp2$week <  wk_i &
+    temp2$week >= wk_i - window,
+  , drop = FALSE]
+
+  # Red Zone EPA
+  if (nrow(t1) > 0 && all(c("yards_to_goal","EPA") %in% names(t1))) {
+    home_rz_epa[i] <- mean(t1$EPA[t1$yards_to_goal <= 20], na.rm = TRUE)
+  }
+  if (nrow(t2) > 0 && all(c("yards_to_goal","EPA") %in% names(t2))) {
+    away_rz_epa[i] <- mean(t2$EPA[t2$yards_to_goal <= 20], na.rm = TRUE)
+  }
+
+  # 4Q Epa
+  if (nrow(t1) > 0 && all(c("period","EPA") %in% names(t1))) {
+    home_q4_epa[i] <- mean(t1$EPA[t1$period == 4], na.rm = TRUE)
+  }
+  if (nrow(t2) > 0 && all(c("period","EPA") %in% names(t2))) {
+    away_q4_epa[i] <- mean(t2$EPA[t2$period == 4], na.rm = TRUE)
+  }
+
+  if (nrow(t1) > 0 && all(c("yds_penalty","game_id") %in% names(t1))) {
+    home_pen_sum <- sum(t1$yds_penalty, na.rm = TRUE)
+    home_games_n <- length(unique(t1$game_id))
+    home_pen_yds_pg[i] <- if (home_games_n > 0) home_pen_sum / home_games_n else NA_real_
+  }
+  if (nrow(t2) > 0 && all(c("yds_penalty","game_id") %in% names(t2))) {
+    away_pen_sum <- sum(t2$yds_penalty, na.rm = TRUE)
+    away_games_n <- length(unique(t2$game_id))
+    away_pen_yds_pg[i] <- if (away_games_n > 0) away_pen_sum / away_games_n else NA_real_
+  }
+}
+
+full_data$home_rz_epa      <- home_rz_epa
+full_data$away_rz_epa      <- away_rz_epa
+full_data$home_q4_epa      <- home_q4_epa
+full_data$away_q4_epa      <- away_q4_epa
+full_data$home_pen_yds_pg  <- home_pen_yds_pg
+full_data$away_pen_yds_pg  <- away_pen_yds_pg
+```
+
+
+```{r Random Forest w/ Derived Variables abd removed "ppa" stats}
+
+set.seed(42)
+spl <- initial_split(full_data, prop = 0.7)
+train_df <- training(spl)
+test_df  <- testing(spl)
+
+
+rec <- recipe(actual_total ~ ., data = train_df) %>%
+  step_rm(
+    game_id, home_team, away_team, ou_binary, ou_result, 
+    notes, season_type, seasonType, formatted_spread, provider,
+    start_time_tbd, start_date, completed, home_division, away_division,
+    highlights, home_score, away_score, home_points, away_points
+  ) %>%
+
+  step_rm(contains("ppa", ignore.case = TRUE)) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_knn(all_predictors(), neighbors = 5)
+
+prep_rec  <- prep(rec, training = train_df)
+train_proc <- bake(prep_rec, new_data = train_df)
+test_proc  <- bake(prep_rec, new_data = test_df)
+
+set.seed(123)
+rf_reg <- ranger(
+  actual_total ~ .,
+  data = train_proc,
+  num.trees = 500,
+  importance = "permutation"
+)
+
+pred_total <- predict(rf_reg, data = test_proc)$predictions
+pred_class <- ifelse(pred_total > test_proc$over_under, "Over", "Under")
+
+cm <- confusionMatrix(
+  factor(pred_class, levels = c("Under","Over")),
+  factor(test_df$ou_result, levels = c("Under","Over")),
+  positive = "Over"
+)
+print(cm)
+
+margin <- pred_total - test_proc$over_under
+truth  <- factor(test_df$ou_result, levels = c("Under","Over"))
+
+roc_obj <- roc(response = truth, predictor = margin,
+               levels = c("Under","Over"), direction = "<")
+auc_val <- auc(roc_obj)
+print(auc_val)
+
+roc_df <- tibble(FPR = 1 - roc_obj$specificities,
+                 TPR = roc_obj$sensitivities)
+
+ggplot(roc_df, aes(FPR, TPR)) +
+  geom_line(size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = paste0("ROC Curve (AUC = ", round(auc_val, 3), ")"),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal(base_size = 14)
+
+```
+
+```{r}
+importance_df <- rf_reg$variable.importance %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  rename(importance = 2) %>%
+  arrange(desc(importance))
+
+# Inspect top 15
+head(importance_df, 15)
+
+# Plot top 15
+importance_df %>%
+  slice_max(order_by = importance, n = 15) %>%
+  ggplot(aes(x = reorder(variable, importance), y = importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 15 Variable Importances (Permutation, RF Regression) – no PPA",
+    x = "Variable", y = "Importance"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+
+```{r Starting 2025 Prediciton}
+df_labeled_2025 <- cfbd_betting_lines(year = 2025, season_type = "regular") %>%
+  mutate(
+    actual_total = suppressWarnings(as.numeric(home_score) + as.numeric(away_score)),
+    ou_result = case_when(
+      !is.na(actual_total) & !is.na(over_under) & actual_total >  over_under ~ "Over",
+      !is.na(actual_total) & !is.na(over_under) & actual_total <  over_under ~ "Under",
+      !is.na(actual_total) & !is.na(over_under) & actual_total == over_under ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    ou_binary = case_when(
+      ou_result == "Over"  ~ 1L,
+      ou_result == "Under" ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  as.data.frame()
+
+```
+
+```{r Converting to df}
+temp2025  <- as.data.frame(cfbd_game_info(2025))
+adv_stats_2025 <- as.data.frame(cfbd_stats_game_advanced(2025))
+```
+
+
+```{r Merging}
+full_data_2025 <- merge(
+  df_labeled_2025, temp2025,
+  by = "game_id", all.x = TRUE, suffixes = c("", ".info")
+)
+```
+
+
+```{r Merging 2}
+full_data_2025 <- merge(
+  full_data_2025, adv_stats_2025,
+  by = "game_id", all.x = TRUE, suffixes = c("", ".adv")
+)
+```
+
+```{r Draft Picks}
+draft_counts <- cfbd_draft_picks(2025) %>%
+  as.data.frame() %>%
+  group_by(college_team) %>%
+  summarise(draft_picks = n(), .groups = "drop")
+
+full_data_2025 <- full_data_2025 %>%
+  left_join(draft_counts, by = c("home_team" = "college_team")) %>%
+  rename(home_draft_picks = draft_picks) %>%
+  left_join(draft_counts, by = c("away_team" = "college_team")) %>%
+  rename(away_draft_picks = draft_picks) %>%
+  mutate(
+    home_draft_picks = tidyr::replace_na(home_draft_picks, 0),
+    away_draft_picks = tidyr::replace_na(away_draft_picks, 0)
+  )
+```
+
+```{r Adv Stats 2025 + Filtering}
+full_data_2025 <- full_data_2025 %>%
+  mutate(
+    season      = dplyr::coalesce(season, season.info),
+    season_type = dplyr::coalesce(season_type, seasonType, season_type.info),
+    week        = suppressWarnings(as.integer(dplyr::coalesce(week, week.info))),
+    start_date  = dplyr::coalesce(start_date, start_date.info),
+
+    home_team   = dplyr::coalesce(home_team, home_team.info),
+    away_team   = dplyr::coalesce(away_team, away_team.info),
+    spread      = dplyr::coalesce(spread, spread),
+    over_under  = dplyr::coalesce(over_under, over_under),
+    provider    = dplyr::coalesce(provider, provider)
+  ) %>%
+  select(
+    -any_of(c("season.info","seasonType","season_type.info",
+              "week.info","start_date.info",
+              "home_team.info","away_team.info",
+              "spread.info","over_under.info","provider.info"))
+  ) %>%
+  distinct(game_id, .keep_all = TRUE) %>%
+  filter(week > 1) 
+```
+
+```{r Derived Variables}
+if (!exists("pbp_2025")) {
+  pbp_2025 <- cfbfastR::load_cfb_pbp(2025)
+}
+pbp_2025       <- as.data.frame(pbp_2025)
+full_data_2025 <- as.data.frame(full_data_2025)
+full_data_2025$week <- suppressWarnings(as.integer(full_data_2025$week))
+
+window <- 5
+n <- nrow(full_data_2025)
+
+pick_col <- function(df, candidates) {
+  nm <- intersect(candidates, names(df))
+  if (length(nm) == 0) NA_character_ else nm[1]
+}
+
+
+pos_col    <- pick_col(temp2025, c("pos_team","offense","offense_team"))
+week_col   <- pick_col(temp2025, c("week","game_week"))
+epa_col    <- pick_col(temp2025, c("EPA","epa"))
+pass_col   <- pick_col(temp2025, c("pass","Pass","is_pass"))
+rush_col   <- pick_col(temp2025, c("rush","Rush","is_rush"))
+period_col <- pick_col(temp2025, c("period","qtr","quarter"))
+ytg_col    <- pick_col(temp2025, c("yards_to_goal","yardline_100"))
+pen_col    <- pick_col(temp2025, c("yds_penalty","penalty_yards","penalty_yds"))
+gid_col    <- pick_col(temp2025, c("game_id","gameId","gameid"))
+
+pbp_2025[[week_col]] <- suppressWarnings(as.integer(pbp_2025[[week_col]]))
+if (!is.na(pass_col)) pbp_2025[[pass_col]] <- as.integer(pbp_2025[[pass_col]] %in% c(1, TRUE))
+if (!is.na(rush_col)) pbp_2025[[rush_col]] <- as.integer(pbp_2025[[rush_col]] %in% c(1, TRUE))
+
+home_rz_epa        <- away_rz_epa        <- rep(NA_real_, n)
+home_q4_epa        <- away_q4_epa        <- rep(NA_real_, n)
+home_pen_yds_pg    <- away_pen_yds_pg    <- rep(NA_real_, n)
+home_min_per_point <- away_min_per_point <- rep(NA_real_, n)
+home_pass_epa      <- away_pass_epa      <- rep(NA_real_, n) 
+home_rush_epa      <- away_rush_epa      <- rep(NA_real_, n) 
+
+for (i in seq_len(n)) {
+  wk_i <- full_data_2025$week[i]
+  hm   <- full_data_2025$home_team[i]
+  aw   <- full_data_2025$away_team[i]
+  if (is.na(wk_i) || is.na(hm) || is.na(aw)) next
+
+  home_mask <- (pbp_2025[[pos_col]] == hm) &
+               (pbp_2025[[week_col]] <  wk_i) &
+               (pbp_2025[[week_col]] >= wk_i - window)
+  home_mask[is.na(home_mask)] <- FALSE
+
+  away_mask <- (pbp_2025[[pos_col]] == aw) &
+               (pbp_2025[[week_col]] <  wk_i) &
+               (pbp_2025[[week_col]] >= wk_i - window)
+  away_mask[is.na(away_mask)] <- FALSE
+
+  t1 <- pbp_2025[home_mask, , drop = FALSE]
+  t2 <- pbp_2025[away_mask, , drop = FALSE]
+
+  if (!is.na(epa_col) && !is.na(pass_col) && nrow(t1) > 0)
+    home_pass_epa[i] <- mean(t1[[epa_col]][t1[[pass_col]] == 1], na.rm = TRUE)
+  if (!is.na(epa_col) && !is.na(rush_col) && nrow(t1) > 0)
+    home_rush_epa[i] <- mean(t1[[epa_col]][t1[[rush_col]] == 1], na.rm = TRUE)
+
+  if (!is.na(epa_col) && !is.na(pass_col) && nrow(t2) > 0)
+    away_pass_epa[i] <- mean(t2[[epa_col]][t2[[pass_col]] == 1], na.rm = TRUE)
+  if (!is.na(epa_col) && !is.na(rush_col) && nrow(t2) > 0)
+    away_rush_epa[i] <- mean(t2[[epa_col]][t2[[rush_col]] == 1], na.rm = TRUE)
+}
+
+
+for (i in seq_len(n)) {
+  wk_i <- full_data_2025$week[i]
+  hm   <- full_data_2025$home_team[i]
+  aw   <- full_data_2025$away_team[i]
+  if (is.na(wk_i) || is.na(hm) || is.na(aw)) next
+
+  home_mask <- (pbp_2025[[pos_col]] == hm) &
+               (pbp_2025[[week_col]] <  wk_i) &
+               (pbp_2025[[week_col]] >= wk_i - window)
+  home_mask[is.na(home_mask)] <- FALSE
+
+  away_mask <- (pbp_2025[[pos_col]] == aw) &
+               (pbp_2025[[week_col]] <  wk_i) &
+               (pbp_2025[[week_col]] >= wk_i - window)
+  away_mask[is.na(away_mask)] <- FALSE
+
+  t1 <- pbp_2025[home_mask, , drop = FALSE]
+  t2 <- pbp_2025[away_mask, , drop = FALSE]
+
+  if (!is.na(epa_col) && !is.na(pass_col) && nrow(t1) > 0)
+    home_pass_epa[i] <- mean(t1[[epa_col]][t1[[pass_col]] == 1], na.rm = TRUE)
+  if (!is.na(epa_col) && !is.na(rush_col) && nrow(t1) > 0)
+    home_rush_epa[i] <- mean(t1[[epa_col]][t1[[rush_col]] == 1], na.rm = TRUE)
+
+  if (!is.na(epa_col) && !is.na(pass_col) && nrow(t2) > 0)
+    away_pass_epa[i] <- mean(t2[[epa_col]][t2[[pass_col]] == 1], na.rm = TRUE)
+  if (!is.na(epa_col) && !is.na(rush_col) && nrow(t2) > 0)
+    away_rush_epa[i] <- mean(t2[[epa_col]][t2[[rush_col]] == 1], na.rm = TRUE)
+}
+
+  if (!is.na(pen_col) && !is.na(gid_col) && nrow(t1) > 0) {
+    pen_sum <- sum(t1[[pen_col]], na.rm = TRUE)
+    g_n     <- length(unique(t1[[gid_col]]))
+    home_pen_yds_pg[i] <- if (g_n > 0) pen_sum / g_n else NA_real_
+  }
+  if (!is.na(pen_col) && !is.na(gid_col) && nrow(t2) > 0) {
+    pen_sum <- sum(t2[[pen_col]], na.rm = TRUE)
+    g_n     <- length(unique(t2[[gid_col]]))
+    away_pen_yds_pg[i] <- if (g_n > 0) pen_sum / g_n else NA_real_
+  }
+
+full_data_2025$home_pass_epa <- home_pass_epa
+full_data_2025$home_rush_epa <- home_rush_epa
+full_data_2025$away_pass_epa <- away_pass_epa
+full_data_2025$away_rush_epa <- away_rush_epa
+full_data_2025$home_rz_epa   <- home_rz_epa
+full_data_2025$away_rz_epa   <- away_rz_epa
+full_data_2025$home_q4_epa   <- home_q4_epa
+full_data_2025$away_q4_epa   <- away_q4_epa
+full_data_2025$home_pen_yds_pg  <- home_pen_yds_pg
+full_data_2025$away_pen_yds_pg  <- away_pen_yds_pg
+
+```
+
+```{r Train/Test}
+current_week <- 13
+wk_train_max <- current_week - 1
+wk_test <- current_week
+
+train_df <- full_data_2025 %>%
+  filter(week <= wk_train_max, !is.na(actual_total))
+test_df  <- full_data_2025 %>% filter(week == wk_test)
+
+test_df  <- test_df %>% filter(!is.na(over_under))
+```
+
+```{r Removing Certain Columns/Imputing}
+rec <- recipe(actual_total ~ ., data = train_df) %>%
+  step_rm(
+    game_id, home_team, away_team, ou_binary, ou_result,
+    start_date, provider, notes, venue,
+    home_points, away_points
+  ) %>%
+  step_mutate(across(where(is.logical), ~ as.integer(.))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_knn(all_predictors(), neighbors = 5) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+```
+
+```{r Prep}
+prep_rec <- prep(rec, training = train_df)
+train_mat <- bake(prep_rec, new_data = train_df)
+test_mat  <- bake(prep_rec, new_data = test_df)
+```
+
+```{r}
+X_train <- as.matrix(select(train_mat, -actual_total))
+y_train <- train_mat$actual_total
+dtrain  <- xgb.DMatrix(data = X_train, label = y_train)
+
+X_test <- as.matrix(select(test_mat, -actual_total))
+dtest  <- xgb.DMatrix(data = X_test)
+```
+
+```{r XGBoost}
+max_depth_vals      <- c(3, 5, 7, 10)
+min_child_weight_vals <- c(1, 3, 5, 7, 10)
+
+cv_params <- expand.grid(
+  max_depth = max_depth_vals,
+  min_child_weight = min_child_weight_vals
+)
+
+rmse_vec      <- rep(NA_real_, nrow(cv_params))
+best_iter_vec <- rep(NA_integer_, nrow(cv_params))
+
+for (i in seq_len(nrow(cv_params))) {
+  set.seed(111111)
+
+  bst_tune <- xgb.cv(
+    data  = dtrain,
+    nfold = 5,              
+    eta   = 0.10,          
+    max_depth        = cv_params$max_depth[i],
+    min_child_weight = cv_params$min_child_weight[i],
+    gamma            = 0,
+    subsample        = 0.8,
+    colsample_bytree = 0.8,
+
+    nrounds = 600,    
+    early_stopping_rounds = 30,
+
+    verbose = 1,
+    print_every_n = 50,
+    nthread = 1,
+
+    objective  = "reg:squarederror",
+    eval_metric = "rmse"
+  )
+
+  rmse_vec[i]      <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_iteration]
+  best_iter_vec[i] <- bst_tune$best_iteration
+}
+
+rmse_vec[i]      <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_iteration]
+best_iter_vec[i] <- bst_tune$best_iteration
+
+res_db <- cbind.data.frame(cv_params, rmse = rmse_vec, best_iter = best_iter_vec) %>%
+  arrange(rmse)
+
+print(res_db)
+```
+
+```{r}
+res_db$max_depth        <- as.factor(res_db$max_depth)
+res_db$min_child_weight <- as.factor(res_db$min_child_weight)
+
+g_rmse <- ggplot(res_db, aes(x = min_child_weight, y = max_depth, fill = rmse)) +
+  geom_tile(color = "white") +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "red", mid = "white", high = "blue",
+    midpoint = median(res_db$rmse, na.rm = TRUE),
+    name = "CV RMSE"
+  ) +
+  labs(x = "Minimum Child Weight", y = "Max Depth",
+       title = "XGBoost CV (eta=0.10): RMSE by Depth × Min Child Weight")
+g_rmse
+```
+
+```{r}
+gamma_vals <- c(0, 0.1, 0.3, 0.5, 1, 2)
+
+auc_vec   <- error_vec <- rep(NA, length(gamma_vals))
+best_iter <- rep(NA, length(gamma_vals))
+
+for(i in seq_along(gamma_vals)){
+  set.seed(111111)
+  bst_tune <- xgb.cv(
+    data = dtrain,
+    nfold = 5, 
+    eta = 0.1,                  
+    max.depth = 3,              
+    min_child_weight = 5,        
+    gamma = gamma_vals[i],     
+    nrounds = 600,            
+    early_stopping_rounds = 20, 
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "reg:squarederror", 
+    eval_metric = "rmse"
+  )
+  
+  best_iter[i] <- bst_tune$best_iteration
+  auc_vec[i]   <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_iteration]
+  error_vec[i] <- bst_tune$evaluation_log$test_rmse_std[bst_tune$best_iteration]
+}
+
+res_gamma <- data.frame(
+  gamma = gamma_vals,
+  rmse = auc_vec,
+  rmse_sd = error_vec,
+  best_iter = best_iter
+)
+
+print(res_gamma)
+```
+
+```{r}
+g_gamma <- ggplot(res_gamma, aes(x = factor(gamma), y = rmse, fill = gamma)) +
+  geom_col() +
+  theme_bw() +
+  labs(x = "Gamma", y = "Test RMSE", title = "XGBoost Tuning: Gamma (max_depth=3, min_child_weight=7)") +
+  theme(legend.position = "none")
+
+print(g_gamma)
+```
+
+```{r Tuning subsample and colsample_by_tree_parameters}
+subsample_vals       <- c(0.6, 0.7, 0.8, 0.9, 1.0)
+colsample_bytree_vals <- c(0.6, 0.7, 0.8, 0.9, 1.0)
+
+cv_params <- expand.grid(
+  subsample = subsample_vals,
+  colsample_bytree = colsample_bytree_vals
+)
+
+rmse_vec      <- rep(NA_real_, nrow(cv_params))
+rmse_sd_vec   <- rep(NA_real_, nrow(cv_params))
+best_iter_vec <- rep(NA_integer_, nrow(cv_params))
+
+for (i in seq_len(nrow(cv_params))) {
+  set.seed(111111)
+  bst_tune <- xgb.cv(
+    data  = dtrain,
+    nfold = 5,
+    eta              = 0.10,
+    max_depth        = 3,
+    min_child_weight = 5,
+    gamma            = 0,
+    subsample        = cv_params$subsample[i],
+    colsample_bytree = cv_params$colsample_bytree[i],
+    nrounds = 1000,
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 50,
+    objective   = "reg:squarederror",
+    eval_metric = "rmse"
+  )
+  best_iter_vec[i] <- bst_tune$best_iteration
+  rmse_vec[i]      <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_iteration]
+  rmse_sd_vec[i]   <- bst_tune$evaluation_log$test_rmse_std[bst_tune$best_iteration]
+}
+
+res_subcol <- cv_params %>%
+  mutate(rmse = rmse_vec,
+         rmse_sd = rmse_sd_vec,
+         best_iter = best_iter_vec) %>%
+  arrange(rmse)
+
+print(res_subcol)
+```
+
+```{r}
+res_plot <- res_subcol %>% filter(!is.na(rmse))
+res_plot$subsample        <- as.factor(res_plot$subsample)
+res_plot$colsample_bytree <- as.factor(res_plot$colsample_bytree)
+
+mid_val <- ifelse(length(unique(res_plot$rmse)) > 1,
+                  median(res_plot$rmse, na.rm = TRUE),
+                  unique(res_plot$rmse)[1])
+
+g_subcol <- ggplot(res_plot, aes(x = colsample_bytree, y = subsample, fill = rmse)) +
+  geom_tile(color = "white") +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "red", mid = "white", high = "blue",
+    midpoint = mid_val,
+    name = "CV RMSE"
+  ) +
+  labs(
+    x = "colsample_bytree",
+    y = "subsample",
+    title = "XGBoost CV Heatmap (eta=0.10, depth=3, min_child=7, gamma=0)"
+  )
+print(g_subcol)
+```
+
+```{r Tuning ETA}
+
+eta_vals <- c(0.3, 0.1, 0.05, 0.01)
+
+results <- data.frame(
+  eta = eta_vals,
+  best_iter = NA_integer_,
+  test_rmse = NA_real_
+)
+
+models <- list()
+
+for (i in seq_along(eta_vals)) {
+  
+  set.seed(111111)
+  bst_cv <- xgb.cv(
+    data  = dtrain,
+    nfold = 5,
+    nrounds = 1000,             
+    early_stopping_rounds = 20,
+    verbose = 1,
+    print_every_n = 20,
+    objective   = "reg:squarederror",
+    eval_metric = "rmse",
+    eta              = eta_vals[i],
+    max_depth        = 3,
+    min_child_weight = 5,
+    gamma            = 0,
+    subsample        = 1,
+    colsample_bytree = 1
+  )
+  
+  results$best_iter[i] <- bst_cv$best_iteration
+  results$test_rmse[i] <- bst_cv$evaluation_log$test_rmse_mean[bst_cv$best_iteration]
+  
+  bst_final <- xgb.train(
+    params = list(
+      objective        = "reg:squarederror",
+      eval_metric      = "rmse",
+      eta              = .05,
+      max_depth        = 3,
+      min_child_weight = 7,
+      gamma            = 0,
+      subsample        = .7,
+      colsample_bytree = 1
+    ),
+    data    = dtrain,
+    nrounds = bst_cv$best_iteration,
+    watchlist = list(train = dtrain),
+    verbose = 0
+  )
+  
+  models[[paste0("eta_", eta_vals[i])]] <- bst_final
+}
+
+print(results)
+```
+
+```{r}
+ggplot(results, aes(x = factor(eta), y = test_rmse, fill = factor(eta))) +
+  geom_col() +
+  theme_bw() +
+  labs(
+    title = "XGBoost CV RMSE by eta (subsample=0.7, colsample_bytree=1)",
+    x = "Learning Rate (eta)", y = "Test RMSE"
+  ) +
+  theme(legend.position = "none")
+```
+```{r Best Model}
+final_params <- list(
+  objective        = "reg:squarederror",
+  eval_metric      = "rmse",
+  eta              = 0.05, 
+  max_depth        = 3,
+  min_child_weight = 5,
+  gamma            = 0,
+  subsample        = 1,
+  colsample_bytree = 1.0
+)
+
+set.seed(111111)
+cv_final <- xgb.cv(
+  params = final_params,
+  data   = dtrain,
+  nfold  = 5,
+  nrounds = 1500,
+  early_stopping_rounds = 20,
+  verbose = 1,
+  print_every_n = 100
+)
+
+best_iter <- cv_final$best_iteration
+
+# Train final model
+set.seed(111111)
+bst_model <- xgb.train(
+  params  = final_params,
+  data    = dtrain,
+  nrounds = best_iter,
+  watchlist = list(train = dtrain),
+  verbose = 1,
+  print_every_n = 100
+)
+
+```
+
+
+```{r}
+pred_total <- predict(bst_model, dtest)
+pred_pick  <- ifelse(pred_total > test_mat$over_under, "Over", "Under")
+pred_margin <- pred_total - test_mat$over_under
+
+pred_tbl <- test_df %>%
+  select(game_id, week, home_team, away_team, over_under, actual_total, ou_result) %>%
+  mutate(
+    pred_total = pred_total,
+    margin = pred_margin,
+    pick   = pred_pick
+  ) %>%
+  arrange(desc(abs(margin)))
+
+print(pred_tbl)
+```
+
+```{r}
+write_xlsx(pred_tbl, "Julian Predictions WK8.xlsx")
+```
+
